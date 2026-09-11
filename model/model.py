@@ -46,18 +46,45 @@ class MiniMindConfig(PretrainedConfig):
 
 # RMSNorm
 # 继承自torch.nn.Module, __init__初始化参数，_norm方法， forward方法定义前向传播逻辑
-
-import torch
-import torch.nn as nn
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
+    def _init_(self, dim: int, eps: float = 1e-6):
+        super()._init_()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-    
-    def _norm(self, x):
+        self. weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x: torch.Tensor):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-    
-    def forward(self, x):
-        return self.weight * self._norm(x.float()).astype(x)
+
+    def forward(self, x: torch.Tensor):
+        return self. weight * self._norm(x.float()).type_as(x)
+
+
+# YaRN
+def precompute_freqs_cis(dim: int, end: int=32 * 1024, rope_base: float = 10000.0, rope_scaling: Optional[dict]=None):
+    # 初始化RoPE频率 theta_i = base^(-2i/dim)
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))
+    attn_factor = 1.0
+
+    if rope_scaling is not None: # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+        rope_scaling.get("original_max_position_embeddings", 2048), 
+        rope_scaling.get("factor", 16), 
+        rope_scaling.get("beta_fast", 32), 
+        rope_scaling.get("beta_slow", 1),
+        rope_scaling.get("attention_factor", 1.0)
+        )
+
+        # 推断长度大于训练长度，使用缩放
+        if end > orig_max:
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            low, high = max(math.floor(inv_dim(beta_slow)), 0), min(math.ceil(inv_dim(beta_fast)), dim // 2)
+            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+            freqs = freqs * (1 - ramp + ramp / factor)
+
+    # 计算频率的余弦和正弦值
+    t = torch.arange(end, device=freqs.device, dtype=freqs.dtype)
+    freqs = torch.outer(t,freqs).float()  # [end, dim // 2]
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([-torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    return freqs_cos, freqs_sin

@@ -4,7 +4,7 @@ Flask==3.0.3
 Flask_Cors==4.0.0
 jieba==0.42.1
 jsonlines==4.0.0
-marshmallow==3.22.0
+mar  shmallow==3.22.0
 # matplotlib==3.10.0
 ngrok==1.4.0
 nltk==3.8
