@@ -203,7 +203,7 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)) 
 
-# MiniMind Decoder Block
+# MiniMind Transformer Layer 
 class MiniMindBlock(nn.Module):
     def __init__(self, layerid: int, config: MiniMindConfig):
         super().__init__()
@@ -213,16 +213,70 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        # 1. Self-Attention
+        # Self-Attention
         residual = hidden_states
-        hidden_states, present_key_value = self.self_attn(
+        hidden_states, present_key_value= self.self_attn(
             self.input_layernorm(hidden_states),
             position_embeddings,
             past_key_value,
             use_cache,
             attention_mask
         )
-        hidden_stastes += residual
+        hidden_states += residual
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value    
 
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MiniMindBlock(i, config) for i in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        freqs_cos, freqs_sin = precompute_freqs_cis(config.head_dim, config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+        # input_ids: [batch_size, seq_len]
+        # attention_mask: [batch_size, seq_len]，1 表示保留，0 表示屏蔽（padding）
+        # past_key_values: list of (past_key, past_value)，各为 [batch_size, past_seq_len, num_key_value_heads, head_dim]
+        # use_cache: 是否返回更新后的 key/value 用于缓存
+        bsz, seq_len = input_ids.size()
+        device = input_ids.device
+
+        if hasattr(past_key_values, 'layers'):past_key_values = None
+        past_key_values = past_key_values or [None] * len(self.layers)
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        # 1. 词嵌入
+        hidden_states = self.embed_tokens(input_ids)  # [batch_size, seq_len, hidden_size]
+        hidden_states = self.dropout(hidden_states)
+
+        # 2. RoPE 旋转位置编码
+        # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
+        if self.freqs_cos[0, 0] == 0:
+            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
+            self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)    
+        position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_len], self.freqs_sin[start_pos: start_pos + seq_len])
+
+        # 3. 注意力 mask
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, None, None, :]  # [batch_size, 1, 1, seq_len]
+        presents = []
+        for layer, past_key_value in zip(self.layers, past_key_values):
+            hidden_states, present_key_value = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(presents)
+
+
+        hidden_states = self.norm(hidden_states)
+        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        return hidden_states, presents, aux_loss
